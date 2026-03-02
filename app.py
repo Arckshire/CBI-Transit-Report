@@ -505,7 +505,7 @@ try:
     if uploaded.name.lower().endswith(".csv"):
         df_raw = pd.read_csv(uploaded)
     else:
-        df_raw = pd.read_excel(uploaded)
+        df_raw = pd.read_excel(uploaded, engine="openpyxl")
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
