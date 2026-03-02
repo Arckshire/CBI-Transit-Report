@@ -125,24 +125,6 @@ def fmt_hours(x: float) -> float:
     return float(round(float(x), 2))
 
 
-def safe_unique_join(values: List[str], limit: int = 25) -> str:
-    """Join unique strings, truncating if too many."""
-    uniq = []
-    seen = set()
-    for v in values:
-        if v is None:
-            continue
-        t = str(v).strip()
-        if not t:
-            continue
-        if t not in seen:
-            seen.add(t)
-            uniq.append(t)
-    if len(uniq) <= limit:
-        return "; ".join(uniq)
-    return "; ".join(uniq[:limit]) + f"; (+{len(uniq) - limit} more)"
-
-
 # -----------------------------
 # Core report computation
 # -----------------------------
@@ -211,7 +193,11 @@ def build_report(df_raw: pd.DataFrame, colmap: Dict[str, str], lane_arrow: str =
         "_transit_hours": transit_hours,
     })[valid_tracked].copy()
 
+    # -----------------------------
     # Carrier Performance
+    # Lanes column = COUNT
+    # Excel hover popup = list of lanes (comment)
+    # -----------------------------
     carrier_cols = [
         "Tenant name", "Carrier name", "Carrier SCAC", "Shipment volume", "Lanes",
         "Total transit time (hours)", "Total transit time (days)",
@@ -222,6 +208,7 @@ def build_report(df_raw: pd.DataFrame, colmap: Dict[str, str], lane_arrow: str =
 
     if df_valid.empty:
         carrier_perf = pd.DataFrame(columns=carrier_cols)
+        carrier_lane_comments: List[str] = []
     else:
         rows = []
         grp = df_valid.groupby(["_tenant", "_carrier"], dropna=False)
@@ -240,15 +227,18 @@ def build_report(df_raw: pd.DataFrame, colmap: Dict[str, str], lane_arrow: str =
             scac_vals = scac_vals[scac_vals != ""]
             scac = scac_vals.value_counts().index[0] if len(scac_vals) else ""
 
-            lanes = g["_lane"].dropna().astype(str).tolist()
-            lanes_txt = safe_unique_join(lanes, limit=25)
+            # Unique lanes for this carrier
+            lanes_unique = sorted(set([str(x).strip() for x in g["_lane"].dropna().astype(str).tolist() if str(x).strip() != ""]))
+            lanes_count = len(lanes_unique)
+            lanes_comment = "\n".join(lanes_unique) if lanes_unique else "(No lanes)"
 
             rows.append({
                 "Tenant name": tenant,
                 "Carrier name": carrier,
                 "Carrier SCAC": scac,
                 "Shipment volume": shipment_volume,
-                "Lanes": lanes_txt,
+                "Lanes": lanes_count,            # <-- count (what you want)
+                "__lanes_comment": lanes_comment, # <-- internal for Excel hover popup
                 "Total transit time (hours)": fmt_hours(total_hours),
                 "Total transit time (days)": round_days_from_hours(total_hours),
                 "Average transit time (hours)": fmt_hours(avg_hours),
@@ -259,13 +249,20 @@ def build_report(df_raw: pd.DataFrame, colmap: Dict[str, str], lane_arrow: str =
                 "Maximum transit time (days)": round_days_from_hours(max_hours),
             })
 
-        carrier_perf = pd.DataFrame(rows, columns=carrier_cols).sort_values(
+        # Build df including internal column then sort; extract comments aligned to sorted rows
+        tmp = pd.DataFrame(rows)
+        tmp = tmp.sort_values(
             ["Tenant name", "Shipment volume", "Carrier name"],
             ascending=[True, False, True],
             kind="mergesort"
         ).reset_index(drop=True)
 
+        carrier_lane_comments = tmp["__lanes_comment"].tolist()
+        carrier_perf = tmp.drop(columns=["__lanes_comment"])[carrier_cols]
+
+    # -----------------------------
     # Lane Performance (grouped visual)
+    # -----------------------------
     lane_cols = [
         "Tenant name", "Lane", "Carrier name", "Carrier SCAC", "Shipment volume",
         "Total transit time (hours)", "Total transit time (days)",
@@ -346,6 +343,7 @@ def build_report(df_raw: pd.DataFrame, colmap: Dict[str, str], lane_arrow: str =
         "counts": counts,
         "summary_detail": summary_detail,
         "carrier_performance": carrier_perf,
+        "carrier_lane_comments": carrier_lane_comments,  # <-- used for Excel hover popups
         "lane_performance": lane_perf,
     }
 
@@ -355,13 +353,14 @@ def build_excel_bytes(
     counts: Dict[str, int],
     summary_detail: pd.DataFrame,
     carrier_perf: pd.DataFrame,
+    carrier_lane_comments: List[str],
     lane_perf: pd.DataFrame,
 ) -> bytes:
     """
     XLSX with formatting:
       - Raw Data
       - Summary (A1:B5 + detail starting row 7)
-      - Carrier Performance
+      - Carrier Performance (Lanes = count + hover popup with lane list)
       - Lane Performance
     """
     output = io.BytesIO()
@@ -436,13 +435,33 @@ def build_excel_bytes(
         ws_cp = writer.sheets["Carrier Performance"]
         for c, name in enumerate(carrier_perf.columns):
             ws_cp.write(0, c, name, fmt_header)
-        ws_cp.set_column(0, 0, 18)
-        ws_cp.set_column(1, 1, 24)
-        ws_cp.set_column(2, 2, 14)
-        ws_cp.set_column(3, 3, 16)
-        ws_cp.set_column(4, 4, 55)
-        if len(carrier_perf.columns) > 5:
-            ws_cp.set_column(5, len(carrier_perf.columns) - 1, 22)
+
+        ws_cp.set_column(0, 0, 18)  # Tenant
+        ws_cp.set_column(1, 1, 24)  # Carrier
+        ws_cp.set_column(2, 2, 14)  # SCAC
+        ws_cp.set_column(3, 3, 16)  # Volume
+
+        # Lanes column should be compact
+        if "Lanes" in carrier_perf.columns:
+            lanes_col = list(carrier_perf.columns).index("Lanes")
+            ws_cp.set_column(lanes_col, lanes_col, 10, fmt_num)
+
+            # Add hover popup comment for each data row (row 1..n)
+            # Note: Excel row indexing here is 0-based. Header is row 0.
+            for i, comment_text in enumerate(carrier_lane_comments):
+                if comment_text and comment_text != "(No lanes)":
+                    ws_cp.write_comment(
+                        i + 1,  # data row
+                        lanes_col,
+                        comment_text,
+                        {"visible": False}
+                    )
+        else:
+            lanes_col = None
+
+        # Set remaining columns widths
+        if len(carrier_perf.columns) > 4:
+            ws_cp.set_column(4, len(carrier_perf.columns) - 1, 22)
 
         # Lane Performance
         lane_perf.to_excel(writer, sheet_name="Lane Performance", index=False)
@@ -590,6 +609,7 @@ if st.button("Generate report"):
 
         summary_detail = report["summary_detail"]
         carrier_perf = report["carrier_performance"]
+        carrier_lane_comments = report["carrier_lane_comments"]
         lane_perf = report["lane_performance"]
 
         with st.expander("Preview: Shipment detail (valid tracked)", expanded=False):
@@ -606,6 +626,7 @@ if st.button("Generate report"):
             counts=counts,
             summary_detail=summary_detail,
             carrier_perf=carrier_perf,
+            carrier_lane_comments=carrier_lane_comments,
             lane_perf=lane_perf,
         )
 
